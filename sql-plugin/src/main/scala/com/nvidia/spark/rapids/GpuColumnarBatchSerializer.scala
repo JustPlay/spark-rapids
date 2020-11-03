@@ -22,7 +22,7 @@ import java.nio.ByteBuffer
 import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
 
-import ai.rapids.cudf.{HostColumnVector, JCudfSerialization, NvtxColor, NvtxRange}
+import ai.rapids.cudf.{HostColumnVector, JCudfSerialization, HostDeserialization, NvtxColor, NvtxRange}
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 
 import org.apache.spark.TaskContext
@@ -140,12 +140,9 @@ private class GpuColumnarBatchSerializerInstance(dataSize: SQLMetric) extends Se
           })
 
           def tryReadNext(): Option[ColumnarBatch] = {
-            // about to start using the GPU in this task
-            GpuSemaphore.acquireIfNecessary(TaskContext.get())
-
             val range = new NvtxRange("Deserialize Batch", NvtxColor.YELLOW)
             try {
-              val tableInfo = JCudfSerialization.readTableFrom(dIn)
+              val tableInfo = HostDeserialization.readTableFrom(dIn)
               try {
                 val contigTable = tableInfo.getContiguousTable
                 if (contigTable == null && tableInfo.getNumRows == 0) {
@@ -153,7 +150,7 @@ private class GpuColumnarBatchSerializerInstance(dataSize: SQLMetric) extends Se
                   None
                 } else {
                   if (contigTable != null) {
-                    Some(GpuColumnVectorFromBuffer.from(contigTable))
+                    Some(RapidsHostColumnVectorFromBuffer.from(contigTable))
                   } else {
                     Some(new ColumnarBatch(Array.empty, tableInfo.getNumRows))
                   }
@@ -200,26 +197,8 @@ private class GpuColumnarBatchSerializerInstance(dataSize: SQLMetric) extends Se
       }
 
       override def readValue[T]()(implicit classType: ClassTag[T]): T = {
-        // about to start using the GPU in this task
-        GpuSemaphore.acquireIfNecessary(TaskContext.get())
-
-        val range = new NvtxRange("Deserialize Batch", NvtxColor.YELLOW)
-        try {
-          val tableInfo = JCudfSerialization.readTableFrom(dIn)
-          val cb = try {
-            val table = tableInfo.getTable
-            if (table != null) {
-              Some(GpuColumnVector.from(table))
-            } else {
-              Some(new ColumnarBatch(Array.empty, tableInfo.getNumRows))
-            }
-          } finally {
-            tableInfo.close()
-          }
-          cb.asInstanceOf[T]
-        } finally {
-          range.close()
-        }
+        // This method is never called by shuffle code.
+        throw new UnsupportedOperationException
       }
 
       override def readObject[T]()(implicit classType: ClassTag[T]): T = {

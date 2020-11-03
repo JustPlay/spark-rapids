@@ -59,7 +59,7 @@
         <profile>
             <id>snapshot-shims</id>
             <activation>
-                <activeByDefault>true</activeByDefault>
+                <activeByDefault>false</activeByDefault>
             </activation>
             <dependencies>
                 <dependency>

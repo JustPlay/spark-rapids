@@ -19,8 +19,10 @@ package org.apache.spark.sql.rapids.execution
 
 import java.util
 
+import scala.collection.mutable.ArrayBuffer
+
 import ai.rapids.cudf.NvtxColor
-import com.nvidia.spark.rapids.{GpuMetricNames, NvtxWithMetrics, ShimLoader}
+import com.nvidia.spark.rapids.{GpuMetricNames, NvtxWithMetrics, ShimLoader, GpuColumnVector, RapidsHostColumnVector}
 
 import org.apache.spark._
 import org.apache.spark.rdd.RDD
@@ -154,6 +156,24 @@ class ShuffledBatchRDD(
     }
   }
 
+  def hostToGpuIteratorWrapper(upstreamIter: Iterator[ColumnarBatch]): Iterator[ColumnarBatch] = {
+    new Iterator[ColumnarBatch] {
+      override def hasNext: Boolean = upstreamIter.hasNext
+
+      override def next(): ColumnarBatch = {
+        val cb = upstreamIter.next()
+        val numColumns = cb.numCols()
+        val numRows = cb.numRows()
+
+        val columns = new ArrayBuffer[GpuColumnVector](numColumns)
+        for (i <- 0 until numColumns) {
+          columns(i) = GpuColumnVector.from(cb.column(i).asInstanceOf[RapidsHostColumnVector].getBase().copyToDevice()).incRefCount()
+        }
+        new ColumnarBatch(columns.toArray, numRows)
+      }
+    }
+  }
+
   override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
     val shuffledRowPartition = split.asInstanceOf[ShuffledBatchRDDPartition]
     val tempMetrics = context.taskMetrics().createTempShuffleReadMetrics()
@@ -192,7 +212,8 @@ class ShuffledBatchRDD(
           context,
           sqlMetricsReporter)
     }
-    reader.read().asInstanceOf[Iterator[Product2[Int, ColumnarBatch]]].map(_._2)
+
+    hostToGpuIteratorWrapper(reader.read().asInstanceOf[Iterator[Product2[Int, ColumnarBatch]]].map(_._2))
   }
 
   override def clearDependencies() {
