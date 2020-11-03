@@ -160,6 +160,7 @@ class ShuffledBatchRDD(
     new Iterator[ColumnarBatch] {
       override def hasNext: Boolean = upstreamIter.hasNext
 
+      // TODO(2020-11-03): we need a fragment-friendly impl，the current code will cause GPU-memory fragmentation
       override def next(): ColumnarBatch = {
         val cb = upstreamIter.next()
         val numColumns = cb.numCols()
