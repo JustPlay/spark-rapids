@@ -38,7 +38,7 @@ object ShuffleFetchThreadPool extends Logging {
 
   private def initialize(maxThreads: Int, keepAliveSeconds: Long = 60): ThreadPoolExecutor = synchronized {
     if (!threadPool.isDefined) {
-      logInfo(s"Initialize background shuffle fetcher(s), maxThreds=$maxThreads, keepAliveSeconds=$keepAliveSeconds")
+      logInfo(s"Initialize background shuffle fetcher(s), maxThreads=$maxThreads, keepAliveSeconds=$keepAliveSeconds")
       val threadFactory = new ThreadFactoryBuilder()
           .setNameFormat("rapids shuffle background fetcher-%d")
           .setDaemon(true)
@@ -64,16 +64,16 @@ object ShuffleFetchThreadPool extends Logging {
 }
 
 object ShuffleBackgroundFetcher {
-  var rapidsConf: Option[RapidsConf] = synchronized {
+  val rapidsConf: Option[RapidsConf] = synchronized {
     Some(new RapidsConf(SparkEnv.get.conf))
   }
 
-  val gpuTargetBatchSizeBytes = {
+  val gpuTargetBatchSizeBytes: Long = {
     val conf = rapidsConf.getOrElse(new RapidsConf(SparkEnv.get.conf))
     conf.gpuTargetBatchSizeBytes
   }
 
-  val pinnedPoolSize = {
+  val pinnedPoolSize: Long = {
     val conf = rapidsConf.getOrElse(new RapidsConf(SparkEnv.get.conf))
     if (conf.pinnedPoolSize > 0) {
       conf.pinnedPoolSize
@@ -87,12 +87,18 @@ object ShuffleBackgroundFetcher {
 }
 
 /**
- * The shuffle background fetch for a spark-task
+ * The shuffle background fetcher(s) for a spark task
  *
  * @param iter the upstream iterator
  * @param maxThreads the size of the threadpool
  */
  class ShuffleBackgroundFetcher(iter: Iterator[ColumnarBatch], maxThreads: Int) extends Iterator[ColumnarBatch] with Logging {
+  assert(iter != null)
+  
+  val context = TaskContext.get()
+  val taskAttemptId = context.taskAttemptId()
+  logInfo(s"Create ShuffleBackgroundFetcher for task-$taskAttemptId")
+
   // whether the fetch has finished
   private var fetchDone = new AtomicBoolean(false)
   def isDone: Boolean = fetchDone.get()
@@ -104,12 +110,12 @@ object ShuffleBackgroundFetcher {
   def stopFetcher(): Unit = hasBackgroundFetcher.set(false)
   def hasFetcher: Boolean = hasBackgroundFetcher.get()
   
-  // the buffer between background fetcher and the iterator
+  // a buffer used to store ColumnarBatch(s) fetched by the background fetcher
+  // the next() called by spark task will take ColumnarBatch from this buffer
   private val bufferPool = new ConcurrentLinkedQueue[ColumnarBatch]
   
   // the current size of data in the bufferPool
-  private val currentSizeOfBufferPool = new AtomicLong(0L)
-
+  private var currentSizeOfBufferPool = new AtomicLong(0L)
   def incCurrentSize(size: Long) = currentSizeOfBufferPool.addAndGet(size)
   def decCurrentSize(size: Long) = currentSizeOfBufferPool.addAndGet(-size)
   def mayFetchContinue: Boolean = currentSizeOfBufferPool.get() < ShuffleBackgroundFetcher.maxSizeOfBufferPool
@@ -119,7 +125,8 @@ object ShuffleBackgroundFetcher {
   override def hasNext: Boolean = {
     if (bufferPool.isEmpty() && !isDone) {
       if (!hasFetcher) {
-        ShuffleFetchThreadPool.submit(new Fetcher(), maxThreads)
+        logInfo(s"Add a background fetcher for task-$taskAttemptId (in hasNext)")
+        ShuffleFetchThreadPool.submit(new Fetcher(taskAttemptId), maxThreads)
       }
 
       // https://stackoverflow.com/questions/5999100/is-there-a-block-until-condition-becomes-true-function-in-java
@@ -128,7 +135,9 @@ object ShuffleBackgroundFetcher {
         lock.synchronized {
           // the background fetcher may notify before we are going into wait, so check again
           if (bufferPool.isEmpty() && !isDone) {
-            wait();
+            logInfo(s"Start waiting the background fetcher for task-$taskAttemptId (in hasNext)")
+            lock.wait();
+            logInfo(s"Finished waiting the background fetcher for task-$taskAttemptId (in hasNext)")
           }
         }
       } catch {
@@ -146,7 +155,7 @@ object ShuffleBackgroundFetcher {
   override def next(): ColumnarBatch = {
     val cb = bufferPool.poll()
     if (cb == null) {
-      throw new IllegalStateException("Nothing to fetch from bufferPool!")
+      throw new IllegalStateException(s"Nothing to fetch from bufferPool, task-$taskAttemptId (in next)")
     }
     
     val size = RapidsHostColumnVector.extractBases(cb).map(_.getHostMemorySize).sum
@@ -154,11 +163,12 @@ object ShuffleBackgroundFetcher {
 
     // add a background fetcher if necessary
     if (!hasFetcher) {
-      ShuffleFetchThreadPool.submit(new Fetcher(), maxThreads)
+      logInfo(s"Add a background fetcher for task-$taskAttemptId (in next)")
+      ShuffleFetchThreadPool.submit(new Fetcher(taskAttemptId), maxThreads)
     }
 
     // convert the host-size ColumnarBatch to device-side ColumnarBatch
-    GpuSemaphore.acquireIfNecessary(TaskContext.get())
+    GpuSemaphore.acquireIfNecessary(context)
         
     // TODO(2020-11-03): we should to do it in a more fragment-friendly way，the current code will cause GPU-memory fragmentation
     val numColumns = cb.numCols()
@@ -179,30 +189,39 @@ object ShuffleBackgroundFetcher {
     }
   }
 
-  class Fetcher() extends Callable[Unit] {
+  private class Fetcher(id: Long = 0) extends Callable[Unit] with Logging {
     override def call(): Unit = {
+      logInfo(s"background shuffle fetcher for task-$id started")
       startFetcher()
-      
+    
       try {
+        if (iter == null) {
+          throw new Exception(s"the input iter for Fetcher is null for task-$id")
+        }
+        
         while (mayFetchContinue && iter.hasNext) {
           val cb = iter.next()
           val size = RapidsHostColumnVector.extractBases(cb).map(_.getHostMemorySize).sum
           incCurrentSize(size)
           bufferPool.add(cb)
-        
           // NOTE: we do not issue a notifyAll() until we have enough data in the bufferPool, so no notifyAll() here
         }
 
         if (!iter.hasNext) {
           setDone()
+          logInfo(s"Fetch finished for spark task-$taskAttemptId")
+        }
+      } catch {
+        case e: Throwable => logInfo(s"background shuffle fetcher for task-$id had exception raised (" + e + ")")
+      } finally {
+        // signal when we finish fetch successfully or on error
+        lock.synchronized {
+          logInfo(s"Signal to spark task-$taskAttemptId")
+          lock.notifyAll()
         }
 
-        // signal when we finish fetch
-        lock.synchronized {
-          notifyAll()
-        }
-      } finally {
         stopFetcher()
+        logInfo(s"background shuffle fetcher for task-$id ended")
       }
     }
   }

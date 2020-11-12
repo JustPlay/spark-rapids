@@ -195,6 +195,7 @@ class ShuffledBatchRDD(
           sqlMetricsReporter)
     }
 
+    // FIXME(2020-11-10): do not hardcode the thread pool size
     new ShuffleBackgroundFetcher(reader.read().asInstanceOf[Iterator[Product2[Int, ColumnarBatch]]].map(_._2), 16)
   }
 
