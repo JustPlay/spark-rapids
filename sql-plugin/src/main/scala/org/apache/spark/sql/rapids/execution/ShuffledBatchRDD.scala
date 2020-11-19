@@ -19,16 +19,15 @@ package org.apache.spark.sql.rapids.execution
 
 import java.util
 
-import scala.collection.mutable.ArrayBuffer
-
 import ai.rapids.cudf.NvtxColor
-import com.nvidia.spark.rapids.{GpuMetricNames, NvtxWithMetrics, ShimLoader, ShuffleBackgroundFetcher}
+import com.nvidia.spark.rapids.{GpuMetricNames, NvtxWithMetrics, ShimLoader, ShuffleBackgroundFetcher, HostToDeviceIteratorWrapper}
 
 import org.apache.spark._
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.execution.{CoalescedPartitioner, CoalescedPartitionSpec, PartialMapperPartitionSpec, PartialReducerPartitionSpec, ShufflePartitionSpec}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLShuffleReadMetricsReporter}
 import org.apache.spark.sql.vectorized.ColumnarBatch
+import org.apache.spark.internal.Logging
 
 case class ShuffledBatchRDDPartition(index: Int, spec: ShufflePartitionSpec) extends Partition
 
@@ -109,7 +108,7 @@ class ShuffledBatchRDD(
     var dependency: ShuffleDependency[Int, ColumnarBatch, ColumnarBatch],
     metrics: Map[String, SQLMetric],
     partitionSpecs: Array[ShufflePartitionSpec])
-    extends RDD[ColumnarBatch](dependency.rdd.context, Nil) {
+    extends RDD[ColumnarBatch](dependency.rdd.context, Nil) with Logging {
 
   def this(
       dependency: ShuffleDependency[Int, ColumnarBatch, ColumnarBatch],
@@ -195,8 +194,18 @@ class ShuffledBatchRDD(
           sqlMetricsReporter)
     }
 
-    // FIXME(2020-11-10): do not hardcode the thread pool size
-    new ShuffleBackgroundFetcher(reader.read().asInstanceOf[Iterator[Product2[Int, ColumnarBatch]]].map(_._2), 16)
+    val iter = reader.read().asInstanceOf[Iterator[Product2[Int, ColumnarBatch]]].map(_._2)
+
+    val taskAttemptId = context.taskAttemptId()
+    val taskAttemptNumber = context.attemptNumber()
+    val partitionId=context.partitionId()
+    val index = split.asInstanceOf[ShuffledBatchRDDPartition].index
+    val stageId = context.stageId()
+    val stageAttemptNumber = context.stageAttemptNumber()
+    logInfo(s"ShuffledBatchRDD.compute(): stage=$stageId:$stageAttemptNumber, partition=$partitionId, task=$taskAttemptId:$taskAttemptNumber")
+
+    new ShuffleBackgroundFetcher(iter)  // background async pool
+    // new HostToDeviceIteratorWrapper(iter) // no pool, only a host -> device wrapper
   }
 
   override def clearDependencies() {

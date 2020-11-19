@@ -38,7 +38,7 @@ object ShuffleFetchThreadPool extends Logging {
 
   private def initialize(maxThreads: Int, keepAliveSeconds: Long = 60): ThreadPoolExecutor = synchronized {
     if (!threadPool.isDefined) {
-      logInfo(s"Initialize background shuffle fetcher(s), maxThreads=$maxThreads, keepAliveSeconds=$keepAliveSeconds")
+      logInfo(s"initialize background shuffle fetcher(s), maxThreads=$maxThreads, keepAliveSeconds=$keepAliveSeconds")
       val threadFactory = new ThreadFactoryBuilder()
           .setNameFormat("rapids shuffle background fetcher-%d")
           .setDaemon(true)
@@ -89,15 +89,15 @@ object ShuffleBackgroundFetcher {
 /**
  * The shuffle background fetcher(s) for a spark task
  *
- * @param iter the upstream iterator
+ * @param upstreamIter the upstream iterator
  * @param maxThreads the size of the threadpool
  */
- class ShuffleBackgroundFetcher(iter: Iterator[ColumnarBatch], maxThreads: Int) extends Iterator[ColumnarBatch] with Logging {
-  assert(iter != null)
+ class ShuffleBackgroundFetcher(upstreamIter: Iterator[ColumnarBatch], maxThreads: Int = 16) extends Iterator[ColumnarBatch] with Logging {
+  assert(upstreamIter != null)
   
   val context = TaskContext.get()
   val taskAttemptId = context.taskAttemptId()
-  logInfo(s"Create ShuffleBackgroundFetcher for task-$taskAttemptId")
+  logInfo(s"initialize background shuffle fetcher for task-$taskAttemptId, poolsize=${ShuffleBackgroundFetcher.maxSizeOfBufferPool} bytes")
 
   // whether the fetch has finished
   private var fetchDone = new AtomicBoolean(false)
@@ -118,111 +118,153 @@ object ShuffleBackgroundFetcher {
   private var currentSizeOfBufferPool = new AtomicLong(0L)
   def incCurrentSize(size: Long) = currentSizeOfBufferPool.addAndGet(size)
   def decCurrentSize(size: Long) = currentSizeOfBufferPool.addAndGet(-size)
+  def currentPoolSize() = currentSizeOfBufferPool.get()
   def mayFetchContinue: Boolean = currentSizeOfBufferPool.get() < ShuffleBackgroundFetcher.maxSizeOfBufferPool
+
+  var numBatchsPutOntoGpu: Int = 0
+  var numBatchsFromUpstream: Int = 0
 
   val lock = new Object()
 
   override def hasNext: Boolean = {
     if (bufferPool.isEmpty() && !isDone) {
       if (!hasFetcher) {
-        logInfo(s"Add a background fetcher for task-$taskAttemptId (in hasNext)")
-        ShuffleFetchThreadPool.submit(new Fetcher(taskAttemptId), maxThreads)
+        logInfo(s"task-$taskAttemptId will add a background fetcher (@bufferPool.isEmpty() but @isDone==false)")
+        ShuffleFetchThreadPool.submit(new Fetcher(taskAttemptId, numBatchsFromUpstream), maxThreads)
       }
 
       // https://stackoverflow.com/questions/5999100/is-there-a-block-until-condition-becomes-true-function-in-java
       // wait the background fetcher
       try {
+        // the background fetcher may notify before we are going into wait, so check again in the lock guard
         lock.synchronized {
-          // the background fetcher may notify before we are going into wait, so check again
           if (bufferPool.isEmpty() && !isDone) {
-            logInfo(s"Start waiting the background fetcher for task-$taskAttemptId (in hasNext)")
+            logInfo(s"task-$taskAttemptId need wait the background fetcher until @bufferPool.isEmpty()==false or @isDone==true")
             lock.wait();
-            logInfo(s"Finished waiting the background fetcher for task-$taskAttemptId (in hasNext)")
+            logInfo(s"task-$taskAttemptId has finished waiting")
           }
         }
       } catch {
-        case e: InterruptedException => logInfo("ShuffleBackgroundFetcher.iterator().hasNext interrupted!")
+        case e: InterruptedException => logInfo("ShuffleBackgroundFetcher.iterator().hasNext() interrupted!")
       }
     }
 
-    if (!bufferPool.isEmpty()) {
-      true
-    } else {
-      false
-    }
+    bufferPool.isEmpty() == false
   }
 
   override def next(): ColumnarBatch = {
-    val cb = bufferPool.poll()
-    if (cb == null) {
-      throw new IllegalStateException(s"Nothing to fetch from bufferPool, task-$taskAttemptId (in next)")
+    val hostColumnarBatch = bufferPool.poll()
+    if (hostColumnarBatch == null) {
+      throw new IllegalStateException(s"Nothing to fetch from @bufferPool, task-$taskAttemptId")
     }
     
-    val size = RapidsHostColumnVector.extractBases(cb).map(_.getHostMemorySize).sum
+    val size = RapidsHostColumnVector.extractBases(hostColumnarBatch).map(_.getHostMemorySize).sum
     decCurrentSize(size)
 
     // add a background fetcher if necessary
     if (!hasFetcher) {
-      logInfo(s"Add a background fetcher for task-$taskAttemptId (in next)")
-      ShuffleFetchThreadPool.submit(new Fetcher(taskAttemptId), maxThreads)
+      logInfo(s"task-$taskAttemptId will add a background fetcher since the @bufferPool has free space for new batch)")
+      ShuffleFetchThreadPool.submit(new Fetcher(taskAttemptId, numBatchsFromUpstream), maxThreads)
     }
-
-    // convert the host-size ColumnarBatch to device-side ColumnarBatch
-    GpuSemaphore.acquireIfNecessary(context)
-        
+  
+    GpuSemaphore.acquireIfNecessary(TaskContext.get)
+    
     // TODO(2020-11-03): we should to do it in a more fragment-friendly way，the current code will cause GPU-memory fragmentation
-    val numColumns = cb.numCols()
-    val numRows = cb.numRows()
+    val numColumns = hostColumnarBatch.numCols()
+    val numRows = hostColumnarBatch.numRows()
     try {
+      var gpuColumnarBatch = new ColumnarBatch(Array.empty, numRows)
+
       if (numColumns > 0) {
-        val gpuColumns = RapidsHostColumnVector.extractBases(cb).map(v => GpuColumnVector.from(v.copyToDevice().incRefCount()))
-        val columns: Array[ColumnVector] = new Array(numColumns)
+        val rapidsColumns = RapidsHostColumnVector.extractBases(hostColumnarBatch).map(cv => GpuColumnVector.from(cv.copyToDevice()))
+        val sparkColumns: Array[ColumnVector] = new Array(numColumns)
         for (i <- 0 until numColumns) {
-          columns(i) = gpuColumns(i)
+          sparkColumns(i) = rapidsColumns(i)
         }
-        new ColumnarBatch(columns, numRows)
-      } else {
-        new ColumnarBatch(Array.empty, numRows)
-      } 
+        gpuColumnarBatch = new ColumnarBatch(sparkColumns, numRows)
+      }
+
+      numBatchsPutOntoGpu = numBatchsPutOntoGpu + 1
+      val size = GpuColumnVector.extractBases(gpuColumnarBatch).map(_.getDeviceMemorySize).sum
+      val taskAttemptId = TaskContext.get().taskAttemptId()
+      logInfo(s"task-$taskAttemptId has successfully put batch=$numBatchsPutOntoGpu onto device, size=$size bytes")
+
+      gpuColumnarBatch
     } finally {
-      cb.close()
+      hostColumnarBatch.close()
     }
   }
 
-  private class Fetcher(id: Long = 0) extends Callable[Unit] with Logging {
+  private class Fetcher(val id: Long, var numBatchsFromUpstream: Int) extends Callable[Unit] with Logging {
     override def call(): Unit = {
-      logInfo(s"background shuffle fetcher for task-$id started")
       startFetcher()
+      logInfo(s"background shuffle fetcher for task-$id started")
     
       try {
-        if (iter == null) {
-          throw new Exception(s"the input iter for Fetcher is null for task-$id")
-        }
-        
-        while (mayFetchContinue && iter.hasNext) {
-          val cb = iter.next()
+        while (mayFetchContinue && upstreamIter.hasNext) {
+          val cb = upstreamIter.next()
           val size = RapidsHostColumnVector.extractBases(cb).map(_.getHostMemorySize).sum
           incCurrentSize(size)
           bufferPool.add(cb)
+          numBatchsFromUpstream = numBatchsFromUpstream + 1
+          val poolSize = currentPoolSize()
+          logInfo(s"background shuffle fetcher for task-$id, $numBatchsFromUpstream batchs fetched, total size=$poolSize")
           // NOTE: we do not issue a notifyAll() until we have enough data in the bufferPool, so no notifyAll() here
         }
 
-        if (!iter.hasNext) {
+        if (!upstreamIter.hasNext) {
           setDone()
-          logInfo(s"Fetch finished for spark task-$taskAttemptId")
+          logInfo(s"fetch finished for spark task-$taskAttemptId, total $numBatchsFromUpstream batchs")
         }
       } catch {
         case e: Throwable => logInfo(s"background shuffle fetcher for task-$id had exception raised (" + e + ")")
       } finally {
         // signal when we finish fetch successfully or on error
         lock.synchronized {
-          logInfo(s"Signal to spark task-$taskAttemptId")
+          logInfo(s"signal to spark task-$taskAttemptId")
           lock.notifyAll()
         }
 
         stopFetcher()
         logInfo(s"background shuffle fetcher for task-$id ended")
       }
+    }
+  }
+}
+
+class HostToDeviceIteratorWrapper(upstreamIter: Iterator[ColumnarBatch]) extends Iterator[ColumnarBatch] with Logging {
+  var batchId: Int = 0
+
+  override def hasNext: Boolean = upstreamIter.hasNext
+   
+  override def next(): ColumnarBatch = {
+    val hostColumnarBatch = upstreamIter.next()
+    batchId = batchId + 1
+    
+    GpuSemaphore.acquireIfNecessary(TaskContext.get)
+    
+    // TODO(2020-11-03): we should to do it in a more fragment-friendly way，the current code will cause GPU-memory fragmentation
+    val numColumns = hostColumnarBatch.numCols()
+    val numRows = hostColumnarBatch.numRows()
+    try {
+      var gpuColumnarBatch = new ColumnarBatch(Array.empty, numRows)
+
+      if (numColumns > 0) {
+        val rapidsColumns = RapidsHostColumnVector.extractBases(hostColumnarBatch).map(cv => GpuColumnVector.from(cv.copyToDevice()))
+        val sparkColumns: Array[ColumnVector] = new Array(numColumns)
+        for (i <- 0 until numColumns) {
+          sparkColumns(i) = rapidsColumns(i)
+        }
+        gpuColumnarBatch = new ColumnarBatch(sparkColumns, numRows)
+      }
+
+      val size = GpuColumnVector.extractBases(gpuColumnarBatch).map(_.getDeviceMemorySize).sum
+      val taskAttemptId = TaskContext.get().taskAttemptId()
+      logInfo(s"task-$taskAttemptId has successfully put batch=$batchId onto device, size=$size bytes")
+
+      gpuColumnarBatch
+    } finally {
+      hostColumnarBatch.close()
     }
   }
 }
