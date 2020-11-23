@@ -12,7 +12,8 @@
  * limitations under the License.
  */
 
-package com.nvidia.spark.rapids
+// In order to access protected[spark] function(s) in TaskContext.scala we need to be in a spark package
+package org.apache.spark.sql.rapids.execution
 
 import java.util.{Collections, Locale}
 import java.util.concurrent._
@@ -25,6 +26,8 @@ import scala.collection.mutable.{ArrayBuffer, LinkedHashMap, Queue}
 import scala.math.max
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder
+
+import com.nvidia.spark.rapids.{RapidsConf, RapidsHostColumnVector, GpuColumnVector, GpuSemaphore}
 
 import org.apache.spark.TaskContext
 import org.apache.spark.SparkEnv
@@ -130,7 +133,7 @@ object ShuffleBackgroundFetcher {
     if (bufferPool.isEmpty() && !isDone) {
       if (!hasFetcher) {
         logInfo(s"task-$taskAttemptId will add a background fetcher (@bufferPool.isEmpty() but @isDone==false)")
-        ShuffleFetchThreadPool.submit(new Fetcher(taskAttemptId, numBatchsFromUpstream), maxThreads)
+        ShuffleFetchThreadPool.submit(new Fetcher(context, numBatchsFromUpstream), maxThreads)
       }
 
       // https://stackoverflow.com/questions/5999100/is-there-a-block-until-condition-becomes-true-function-in-java
@@ -164,7 +167,7 @@ object ShuffleBackgroundFetcher {
     // add a background fetcher if necessary
     if (!hasFetcher) {
       logInfo(s"task-$taskAttemptId will add a background fetcher since the @bufferPool has free space for new batch)")
-      ShuffleFetchThreadPool.submit(new Fetcher(taskAttemptId, numBatchsFromUpstream), maxThreads)
+      ShuffleFetchThreadPool.submit(new Fetcher(context, numBatchsFromUpstream), maxThreads)
     }
   
     GpuSemaphore.acquireIfNecessary(TaskContext.get)
@@ -195,8 +198,15 @@ object ShuffleBackgroundFetcher {
     }
   }
 
-  private class Fetcher(val id: Long, var numBatchsFromUpstream: Int) extends Callable[Unit] with Logging {
+  private class Fetcher(val context: TaskContext, var numBatchsFromUpstream: Int) extends Callable[Unit] with Logging {
     override def call(): Unit = {
+      TaskContext.setTaskContext(context)
+      val taskAttemptId = context.taskAttemptId()
+      val id = TaskContext.get().taskAttemptId()
+      if (id != taskAttemptId) {
+        logInfo(s"background shuffle fetcher for task-$id (id=$id not same with taskAttemptId=$taskAttemptId)")
+      }
+
       startFetcher()
       logInfo(s"background shuffle fetcher for task-$id started")
     
