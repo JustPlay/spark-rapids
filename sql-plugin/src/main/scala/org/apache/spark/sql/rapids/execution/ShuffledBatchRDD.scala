@@ -18,9 +18,10 @@
 package org.apache.spark.sql.rapids.execution
 
 import java.util
+import java.util.Date
 
 import ai.rapids.cudf.NvtxColor
-import com.nvidia.spark.rapids.{GpuMetricNames, NvtxWithMetrics, ShimLoader}
+import com.nvidia.spark.rapids.{GpuMetricNames, NvtxWithMetrics, ShimLoader, RapidsConf}
 
 import org.apache.spark._
 import org.apache.spark.rdd.RDD
@@ -28,6 +29,7 @@ import org.apache.spark.sql.execution.{CoalescedPartitioner, CoalescedPartitionS
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLShuffleReadMetricsReporter}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.internal.Logging
+import org.apache.spark.SparkEnv
 
 case class ShuffledBatchRDDPartition(index: Int, spec: ShufflePartitionSpec) extends Partition
 
@@ -202,14 +204,25 @@ class ShuffledBatchRDD(
     val index = split.asInstanceOf[ShuffledBatchRDDPartition].index
     val stageId = context.stageId()
     val stageAttemptNumber = context.stageAttemptNumber()
-    logInfo(s"ShuffledBatchRDD.compute(): stage=$stageId:$stageAttemptNumber, partition=$partitionId, task=$taskAttemptId:$taskAttemptNumber")
-
-    new ShuffleBackgroundFetcher(iter)  // background async pool
-    // new HostToDeviceIteratorWrapper(iter) // no pool, only a host -> device wrapper
+    
+   
+    if (shuffleReadType == "POOL.ASYNC") {
+      logInfo(s"stage=$stageId:$stageAttemptNumber, partition=$partitionId, task=$taskAttemptId:$taskAttemptNumber, shuffle=$shuffleReadType")
+      new ShuffleBackgroundFetcher(iter)
+    } else if (shuffleReadType == "HOST.DESER") {
+      logInfo(s"stage=$stageId:$stageAttemptNumber, partition=$partitionId, task=$taskAttemptId:$taskAttemptNumber, shuffle=$shuffleReadType")
+      new HostToDeviceIteratorWrapper(iter)
+    } else {
+      logInfo(s"stage=$stageId:$stageAttemptNumber, partition=$partitionId, task=$taskAttemptId:$taskAttemptNumber, shuffle=$shuffleReadType")
+      new TimeCountingIteratorWrapper(iter)
+    }
   }
 
   override def clearDependencies() {
     super.clearDependencies()
     dependency = null
   }
+
+   // we can not store a RapidsConf object here since 'java.io.NotSerializableException: com.nvidia.spark.rapids.RapidsConf'
+  val shuffleReadType = new RapidsConf(SparkEnv.get.conf).shuffleReadType
 }

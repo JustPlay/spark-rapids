@@ -348,6 +348,11 @@ object RapidsConf {
     .stringConf
     .createWithDefault("ARENA")
 
+  val SHUFFLE_READ_TYPE = conf("spark.rapids.shuffle.read.type")
+    .doc("Select the shuffle read type. Valid values are \"DEFAULT\", \"HOST.DESER\", and " + "\"POOL.ASYNC\".")
+    .stringConf
+    .createWithDefault("DEFAULT")
+
   val CONCURRENT_GPU_TASKS = conf("spark.rapids.sql.concurrentGpuTasks")
       .doc("Set the number of tasks that can execute concurrently per GPU. " +
           "Tasks may temporarily block when the number of concurrent tasks in the executor " +
@@ -936,6 +941,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val rmmAllocMaxFraction: Double = get(RMM_ALLOC_MAX_FRACTION)
 
   lazy val rmmAllocReserve: Long = get(RMM_ALLOC_RESERVE)
+  
+  lazy val shuffleReadType: String = get(SHUFFLE_READ_TYPE)
 
   lazy val hostSpillStorageSize: Long = get(HOST_SPILL_STORAGE_SIZE)
 

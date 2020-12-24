@@ -29,6 +29,10 @@ import org.apache.spark.TaskContext
 import org.apache.spark.serializer.{DeserializationStream, SerializationStream, Serializer, SerializerInstance}
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.vectorized.ColumnarBatch
+import org.apache.spark.SparkEnv
+
+import org.apache.spark.internal.Logging
+import java.util.Date
 
 /**
  * Serializer for serializing `ColumnarBatch`s during shuffle.
@@ -126,9 +130,9 @@ private class GpuColumnarBatchSerializerInstance(dataSize: SQLMetric) extends Se
   }
 
   override def deserializeStream(in: InputStream): DeserializationStream = {
-    new DeserializationStream {
+    new DeserializationStream with Logging {
       private[this] val dIn: DataInputStream = new DataInputStream(new BufferedInputStream(in))
-
+     
       override def asKeyValueIterator: Iterator[(Int, ColumnarBatch)] = {
         new Iterator[(Int, ColumnarBatch)] {
           var toBeReturned: Option[ColumnarBatch] = None
@@ -140,6 +144,22 @@ private class GpuColumnarBatchSerializerInstance(dataSize: SQLMetric) extends Se
           })
           
           def tryReadNext(): Option[ColumnarBatch] = {
+            if (shuffleReadType == "POOL.ASYNC" || shuffleReadType == "HOST.DESER") {
+              tryReadNextOnHost()
+            } else {
+              tryReadNextDefault()
+            }
+          }
+
+          def tryReadNextOnHost(): Option[ColumnarBatch] = {     
+            var result: Option[ColumnarBatch] = None
+
+            // val context = TaskContext.get()
+            // val taskAttemptId = context.taskAttemptId()
+            // val stageId = context.stageId()
+
+            // val timeStart = System.nanoTime()
+
             val range = new NvtxRange("Deserialize Batch", NvtxColor.YELLOW)
             try {
               val tableInfo = HostDeserialization.readTableFrom(dIn)
@@ -147,12 +167,12 @@ private class GpuColumnarBatchSerializerInstance(dataSize: SQLMetric) extends Se
                 val contigTable = tableInfo.getContiguousTable
                 if (contigTable == null && tableInfo.getNumRows == 0) {
                   dIn.close()
-                  None
+                  result = None
                 } else {
                   if (contigTable != null) {
-                    Some(RapidsHostColumnVectorFromBuffer.from(contigTable))
+                    result = Some(RapidsHostColumnVectorFromBuffer.from(contigTable))
                   } else {
-                    Some(new ColumnarBatch(Array.empty, tableInfo.getNumRows))
+                    result = Some(new ColumnarBatch(Array.empty, tableInfo.getNumRows))
                   }
                 }
               } finally {
@@ -161,13 +181,30 @@ private class GpuColumnarBatchSerializerInstance(dataSize: SQLMetric) extends Se
             } finally {
               range.close()
             }
+                        
+            // val timeEnded = System.nanoTime()
+            // val timeInMilliSeconds = (timeEnded - timeStart) / 1000000.0
+            // // `shuffle.time.read.deser` include time for
+            // // 1. `allocate a HostMemoryBuffer and read the table from InputStream into it`
+            // // 2. `deserialize the table and slicing the HostMemoryBuffer`,
+            // // 3. `wrapp the sliced HostMemoryBuffer into a ColumnarBatch`
+            // logInfo(s"stage=$stageId, task=$taskAttemptId, shuffle.time.read.deser=$timeInMilliSeconds")
+
+            result
           }
           
-          /*
-          def tryReadNext(): Option[ColumnarBatch] = {
+          def tryReadNextDefault(): Option[ColumnarBatch] = {
+            var result: Option[ColumnarBatch] = None
+
             // about to start using the GPU in this task
             GpuSemaphore.acquireIfNecessary(TaskContext.get())
+            
+            // val context = TaskContext.get()
+            // val taskAttemptId = context.taskAttemptId()
+            // val stageId = context.stageId()
 
+            // val timeStart = System.nanoTime()
+          
             val range = new NvtxRange("Deserialize Batch", NvtxColor.YELLOW)
             try {
               val tableInfo = JCudfSerialization.readTableFrom(dIn)
@@ -175,12 +212,12 @@ private class GpuColumnarBatchSerializerInstance(dataSize: SQLMetric) extends Se
                 val contigTable = tableInfo.getContiguousTable
                 if (contigTable == null && tableInfo.getNumRows == 0) {
                   dIn.close()
-                  None
+                  result = None
                 } else {
                   if (contigTable != null) {
-                    Some(GpuColumnVectorFromBuffer.from(contigTable))
+                    result = Some(GpuColumnVectorFromBuffer.from(contigTable))
                   } else {
-                    Some(new ColumnarBatch(Array.empty, tableInfo.getNumRows))
+                    result = Some(new ColumnarBatch(Array.empty, tableInfo.getNumRows))
                   }
                 }
               } finally {
@@ -189,8 +226,18 @@ private class GpuColumnarBatchSerializerInstance(dataSize: SQLMetric) extends Se
             } finally {
               range.close()
             }
+            
+            // val timeEnded = System.nanoTime()
+            // val timeInMilliSeconds = (timeEnded - timeStart) / 1000000.0
+            // // `shuffle.time.read.deser` include time for
+            // // 1. `allocate a HostMemoryBuffer and read the table from InputStream into it`
+            // // 2. `allocate a DeviceMemoryBuffer and copy data from HostMemoryBuffer`
+            // // 3. `deserialize the table and slicing the DeviceMemoryBuffer`,
+            // // 4. `wrapp the sliced DeviceMemoryBuffer into a ColumnarBatch`
+            // logInfo(s"stage=$stageId, task=$taskAttemptId, shuffle.time.read.deser=$timeInMilliSeconds")
+
+            result
           }
-          */
 
           override def hasNext: Boolean = {
             if (toBeReturned.isEmpty) {
@@ -224,8 +271,16 @@ private class GpuColumnarBatchSerializerInstance(dataSize: SQLMetric) extends Se
         // this is going to be discarded anyways.
         null.asInstanceOf[T]
       }
-
+      
       override def readValue[T]()(implicit classType: ClassTag[T]): T = {
+        if (shuffleReadType == "POOL.ASYNC" || shuffleReadType == "HOST.DESER") {
+          readValueOnHost()
+        } else {
+          readValueDefault()
+        }
+      }
+
+      def readValueOnHost[T]()(implicit classType: ClassTag[T]): T = {
         val range = new NvtxRange("Deserialize Batch", NvtxColor.YELLOW)
         try {
           val tableInfo = HostDeserialization.readTableFrom(dIn)
@@ -246,8 +301,7 @@ private class GpuColumnarBatchSerializerInstance(dataSize: SQLMetric) extends Se
         }
       }
 
-      /*
-      override def readValue[T]()(implicit classType: ClassTag[T]): T = {
+      def readValueDefault[T]()(implicit classType: ClassTag[T]): T = {
         // about to start using the GPU in this task
         GpuSemaphore.acquireIfNecessary(TaskContext.get())
 
@@ -269,7 +323,6 @@ private class GpuColumnarBatchSerializerInstance(dataSize: SQLMetric) extends Se
           range.close()
         }
       }
-      */
 
       override def readObject[T]()(implicit classType: ClassTag[T]): T = {
         // This method is never called by shuffle code.
@@ -288,4 +341,6 @@ private class GpuColumnarBatchSerializerInstance(dataSize: SQLMetric) extends Se
     throw new UnsupportedOperationException
   override def deserialize[T: ClassTag](bytes: ByteBuffer, loader: ClassLoader): T =
     throw new UnsupportedOperationException
+
+  val shuffleReadType = new RapidsConf(SparkEnv.get.conf).shuffleReadType
 }

@@ -19,6 +19,7 @@ package com.nvidia.spark.rapids;
 import ai.rapids.cudf.HostColumnVector;
 import ai.rapids.cudf.ContiguousHostTable;
 import ai.rapids.cudf.HostMemoryBuffer;
+import ai.rapids.cudf.DeviceMemoryBuffer;
 import ai.rapids.cudf.HostTable;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
@@ -33,6 +34,8 @@ public final class RapidsHostColumnVectorFromBuffer extends RapidsHostColumnVect
     return from(table, buffer);
   }
 
+  // the returned `ColumnarBatch` warps a list of `RapidsHostColumnVectorFromBuffer` not `RapidsHostColumnVector`
+  // `RapidsHostColumnVectorFromBuffer` contains a reference to the underlying `HostMemoryBuffer`
   public static ColumnarBatch from(HostTable table, HostMemoryBuffer buffer) {
     long rows = table.getRowCount();
     if (rows != (int) rows) {
@@ -60,6 +63,15 @@ public final class RapidsHostColumnVectorFromBuffer extends RapidsHostColumnVect
   private RapidsHostColumnVectorFromBuffer(DataType type, HostColumnVector cudfColumn, HostMemoryBuffer buffer) {
     super(type, cudfColumn);
     this.buffer = buffer;
+  }
+
+  // copy the underlying `HostMemoryBuffer` to device，and return a `DeviceMemoryBuffer` object
+  // NOTE: since all the `RapidsHostColumnVectorFromBuffer`s in `HostTable` share the same underlying `HostMemoryBuffer`, 
+  //       so you should only call this method on any one of the `RapidsHostColumnVectorFromBuffer`
+  public DeviceMemoryBuffer copyTheUnderlyingBufferToDevice() {
+    DeviceMemoryBuffer devBuffer = DeviceMemoryBuffer.allocate(buffer.getLength());
+    devBuffer.copyFromHostBuffer(buffer);
+    return devBuffer;
   }
 
   /**

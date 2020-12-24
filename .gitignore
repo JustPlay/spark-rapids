@@ -28,3 +28,4 @@ scalastyle.txt
 target/
 */metastore_db
 */spark-warehouse
+spark-rapids.dev.tgz
